@@ -2,6 +2,12 @@ package com.kopo.jimin;
 
 import java.sql.*;
 
+/**
+ * 배치 처리 성능 비교 - CallableStatement 방식 2단계
+ * 특징: Anonymous Block(PL/SQL)으로 쿠폰 계산 로직 구현 후 Java의 CallableStatement 객체 사용
+ * 처리방식: Bulk Collect 사용, 1000건 단위 Fetch, 배열 단위 쿠폰계산, FORALL 배치 Insert, 10,000 단위 Commit
+ * 효과: 모든 로직을 DB 서버에서 처리 + Bulk 처리로 성능 극대화 (네트워크 트래픽 최소화)
+ */
 public class Calc_Bonus_by_callstmt_2 {
 
     // 데이터베이스 연결 정보
@@ -23,18 +29,17 @@ public class Calc_Bonus_by_callstmt_2 {
         try {
             System.out.println("=== 배치 처리 시작 - CallableStatement 방식 2단계 ===");
             System.out.println("처리 방식: PL/SQL Anonymous Block (DB 서버에서 모든 로직 처리)");
-            System.out.println("특징: Bulk Collect + Forall (1,000개 단위 Fetch/계산/Insert/Commit)");
+            System.out.println("특징: Bulk Collect + FORALL + 1000건 단위 배치 처리 + 10,000건 단위 Commit");
 
             // 1. 데이터베이스 연결
             conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD);
-            conn.setAutoCommit(false); // PL/SQL 내에서 COMMIT 처리
+            conn.setAutoCommit(false);
             System.out.println("데이터베이스 연결 성공");
 
             // 2. 기존 데이터 삭제
             truncateTable(conn);
 
-            // 3. PL/SQL Anonymous Block 생성 (Bulk Collect + Forall 적용)
-            // 1000개 단위로 Fetch, 계산, Insert, Commit을 수행합니다.
+            // 3. PL/SQL Anonymous Block 생성 (Bulk Collect + FORALL 방식)
             String plsqlBlock = """
                 DECLARE
                     -- 변수 선언
@@ -42,38 +47,47 @@ public class Calc_Bonus_by_callstmt_2 {
                     v_insert_count NUMBER := 0;
                     v_commit_count NUMBER := 0;
                     v_error_count NUMBER := 0;
+                    v_bulk_count NUMBER := 0;
+                    v_batch_size CONSTANT NUMBER := 1000; -- Bulk Collect 배치 크기
                     
-                    -- PL/SQL Collection Types (Nested Table)
-                    TYPE customer_id_tt IS TABLE OF CUSTOMER.ID%TYPE;
-                    TYPE customer_email_tt IS TABLE OF CUSTOMER.EMAIL%TYPE;
-                    TYPE customer_credit_limit_tt IS TABLE OF CUSTOMER.CREDIT_LIMIT%TYPE;
-                    TYPE customer_gender_tt IS TABLE OF CUSTOMER.GENDER%TYPE;
-                    TYPE customer_address1_tt IS TABLE OF CUSTOMER.ADDRESS1%TYPE;
-                    TYPE customer_address2_tt IS TABLE OF CUSTOMER.ADDRESS2%TYPE;
-                    TYPE bonus_coupon_cd_tt IS TABLE OF BONUS_COUPON.COUPON_CD%TYPE;
-                    TYPE bonus_credit_point_tt IS TABLE OF BONUS_COUPON.CREDIT_POINT%TYPE;
+                    -- Customer Record Type 정의
+                    TYPE customer_rec_type IS RECORD (
+                        id VARCHAR2(50),
+                        email VARCHAR2(100),
+                        credit_limit NUMBER,
+                        gender VARCHAR2(1),
+                        address1 VARCHAR2(100),
+                        address2 VARCHAR2(100),
+                        enroll_dt DATE
+                    );
                     
-                    l_customer_ids        customer_id_tt;
-                    l_customer_emails     customer_email_tt;
-                    l_credit_limits       customer_credit_limit_tt;
-                    l_genders             customer_gender_tt;
-                    l_addresses1          customer_address1_tt;
-                    l_addresses2          customer_address2_tt;
+                    -- Customer Array Type 정의
+                    TYPE customer_array_type IS TABLE OF customer_rec_type;
+                    v_customers customer_array_type;
                     
-                    l_coupon_codes        bonus_coupon_cd_tt;
-                    l_final_credit_points bonus_credit_point_tt;
+                    -- Coupon Array Types 정의 (FORALL용)
+                    TYPE varchar2_array IS TABLE OF VARCHAR2(10);
+                    TYPE varchar2_100_array IS TABLE OF VARCHAR2(100);
+                    TYPE number_array IS TABLE OF NUMBER;
+                    TYPE date_array IS TABLE OF DATE;
                     
-                    -- Cursor 선언: 2013년 이후 가입 고객 (Bulk Collect용)
+                    v_coupon_codes varchar2_array := varchar2_array();
+                    v_customer_ids varchar2_100_array := varchar2_100_array();
+                    v_emails varchar2_100_array := varchar2_100_array();
+                    v_credit_points number_array := number_array();
+                    v_send_dts date_array := date_array();
+                    
+                    -- Cursor 선언: 2018년 이후 가입 고객
                     CURSOR customer_cursor IS
-                        SELECT ID, EMAIL, CREDIT_LIMIT, GENDER, ADDRESS1, ADDRESS2
+                        SELECT ID, EMAIL, CREDIT_LIMIT, GENDER, ADDRESS1, ADDRESS2, ENROLL_DT
                         FROM CUSTOMER 
-                        WHERE ENROLL_DT >= DATE '2013-01-01'
+                        WHERE ENROLL_DT >= DATE '2018-01-01'
                           AND CREDIT_LIMIT IS NOT NULL 
                           AND EMAIL IS NOT NULL 
                           AND ID IS NOT NULL
                         ORDER BY ID;
                     
-                    -- 쿠폰 코드 계산 함수 (동일)
+                    -- 쿠폰 코드 계산 함수
                     FUNCTION calculate_coupon_code(
                         p_credit_limit NUMBER,
                         p_gender VARCHAR2,
@@ -85,6 +99,7 @@ public class Calc_Bonus_by_callstmt_2 {
                         ELSIF p_credit_limit >= 1000 AND p_credit_limit < 3000 THEN
                             RETURN 'BB';
                         ELSIF p_credit_limit >= 3000 AND p_credit_limit < 4000 THEN
+                            -- 특별 조건: 송파구 풍납1동 거주 여성 고객
                             IF p_gender = 'F' AND p_address IS NOT NULL AND
                                INSTR(p_address, '송파구') > 0 AND INSTR(p_address, '풍납1동') > 0 THEN
                                 RETURN 'C2';
@@ -103,104 +118,129 @@ public class Calc_Bonus_by_callstmt_2 {
                     
                 BEGIN
                     -- 시작 메시지
-                    DBMS_OUTPUT.PUT_LINE('=== PL/SQL 쿠폰 발급 처리 시작 (BULK COLLECT + FORALL) ===');
-                    DBMS_OUTPUT.PUT_LINE('처리 방식: ' || (1000) || ' Row 단위 Fetch/계산/Insert/Commit');
+                    DBMS_OUTPUT.PUT_LINE('=== PL/SQL 쿠폰 발급 처리 시작 (Bulk Collect + FORALL) ===');
+                    DBMS_OUTPUT.PUT_LINE('처리 방식: Bulk Collect (' || v_batch_size || '건) + FORALL 배치 Insert');
                     
+                    -- Cursor 열기
                     OPEN customer_cursor;
+                    
                     LOOP
-                        -- Bulk Collect: 1000개 단위로 데이터를 컬렉션에 가져오기
-                        FETCH customer_cursor BULK COLLECT INTO 
-                            l_customer_ids, l_customer_emails, l_credit_limits, 
-                            l_genders, l_addresses1, l_addresses2
-                        LIMIT 1000; -- 한 번에 가져올 행 수 지정
+                        -- Bulk Collect로 1000건씩 한 번에 가져오기
+                        FETCH customer_cursor BULK COLLECT INTO v_customers LIMIT v_batch_size;
                         
-                        EXIT WHEN l_customer_ids.COUNT = 0; -- 더 이상 가져올 데이터가 없으면 루프 종료
+                        -- 가져온 데이터가 없으면 종료
+                        EXIT WHEN v_customers.COUNT = 0;
                         
-                        -- 컬렉션 초기화 및 크기 조정
-                        l_coupon_codes := bonus_coupon_cd_tt(); -- 중요: 매번 새로운 배치 처리를 위해 재초기화
-                        l_final_credit_points := bonus_credit_point_tt(); -- 중요: 매번 새로운 배치 처리를 위해 재초기화
+                        v_bulk_count := v_bulk_count + 1;
+                        v_processed_count := v_processed_count + v_customers.COUNT;
                         
-                        l_coupon_codes.EXTEND(l_customer_ids.COUNT);
-                        l_final_credit_points.EXTEND(l_customer_ids.COUNT);
+                        DBMS_OUTPUT.PUT_LINE('Bulk ' || v_bulk_count || ': ' || v_customers.COUNT || '건 로드됨 (누적: ' || v_processed_count || '건)');
                         
-                        -- Bulk 처리된 각 행에 대해 쿠폰 코드 계산
-                        FOR i IN 1..l_customer_ids.COUNT LOOP
+                        -- 배열 초기화
+                        v_coupon_codes.DELETE;
+                        v_customer_ids.DELETE;
+                        v_emails.DELETE;
+                        v_credit_points.DELETE;
+                        v_send_dts.DELETE;
+                        
+                        -- 배치 단위로 쿠폰 코드 계산 및 배열 구성
+                        FOR i IN 1..v_customers.COUNT LOOP
                             DECLARE
-                                v_current_full_address VARCHAR2(200);
+                                v_coupon_code VARCHAR2(10);
+                                v_full_address VARCHAR2(200);
                             BEGIN
-                                v_processed_count := v_processed_count + 1;
+                                -- 주소 연결
+                                v_full_address := NVL(v_customers(i).address1, '') || ' ' || NVL(v_customers(i).address2, '');
                                 
-                                v_current_full_address := NVL(l_addresses1(i), '') || ' ' || NVL(l_addresses2(i), '');
-                                
-                                l_coupon_codes(i) := calculate_coupon_code(
-                                    l_credit_limits(i),
-                                    l_genders(i),
-                                    v_current_full_address
+                                -- 쿠폰 코드 계산
+                                v_coupon_code := calculate_coupon_code(
+                                    v_customers(i).credit_limit,
+                                    v_customers(i).gender,
+                                    v_full_address
                                 );
-                                l_final_credit_points(i) := l_credit_limits(i);
                                 
-                                IF l_coupon_codes(i) IS NOT NULL THEN
-                                    v_insert_count := v_insert_count + 1;
+                                -- 쿠폰 코드가 유효한 경우 배열에 추가
+                                IF v_coupon_code IS NOT NULL THEN
+                                    v_coupon_codes.EXTEND;
+                                    v_customer_ids.EXTEND;
+                                    v_emails.EXTEND;
+                                    v_credit_points.EXTEND;
+                                    v_send_dts.EXTEND;
+                                    
+                                    v_coupon_codes(v_coupon_codes.COUNT) := v_coupon_code;
+                                    v_customer_ids(v_customer_ids.COUNT) := v_customers(i).id;
+                                    v_emails(v_emails.COUNT) := v_customers(i).email;
+                                    v_credit_points(v_credit_points.COUNT) := v_customers(i).credit_limit;
+                                    v_send_dts(v_send_dts.COUNT) := NULL;
                                 END IF;
                                 
                             EXCEPTION
                                 WHEN OTHERS THEN
                                     v_error_count := v_error_count + 1;
-                                    DBMS_OUTPUT.PUT_LINE('데이터 처리 중 오류 (고객ID: ' || l_customer_ids(i) || '): ' || SQLERRM);
-                                    l_coupon_codes(i) := NULL; -- 오류 발생 시 쿠폰 발급 안함
-                                    l_final_credit_points(i) := NULL;
+                                    DBMS_OUTPUT.PUT_LINE('쿠폰 계산 오류 (고객ID: ' || v_customers(i).id || '): ' || SQLERRM);
                             END;
                         END LOOP;
                         
-                        -- 유효한 쿠폰만 담을 새로운 컬렉션을 만들어 FORALL에 전달
-                        DECLARE
-                            -- **수정: 매 루프마다 명시적으로 초기화**
-                            l_valid_customer_ids        customer_id_tt := customer_id_tt();
-                            l_valid_customer_emails     customer_email_tt := customer_email_tt();
-                            l_valid_coupon_codes        bonus_coupon_cd_tt := bonus_coupon_cd_tt();
-                            l_valid_credit_points       bonus_credit_point_tt := bonus_credit_point_tt();
-                        BEGIN
-                            FOR i IN 1..l_customer_ids.COUNT LOOP
-                                IF l_coupon_codes(i) IS NOT NULL THEN
-                                    l_valid_customer_ids.EXTEND; l_valid_customer_ids(l_valid_customer_ids.COUNT) := l_customer_ids(i);
-                                    l_valid_customer_emails.EXTEND; l_valid_customer_emails(l_valid_customer_emails.COUNT) := l_customer_emails(i);
-                                    l_valid_coupon_codes.EXTEND; l_valid_coupon_codes(l_valid_coupon_codes.COUNT) := l_coupon_codes(i);
-                                    l_valid_credit_points.EXTEND; l_valid_credit_points(l_valid_credit_points.COUNT) := l_final_credit_points(i);
-                                END IF;
-                            END LOOP;
-                            
-                            IF l_valid_customer_ids.COUNT > 0 THEN -- **중요: 비어있지 않을 때만 FORALL 실행**
-                                FORALL i IN 1..l_valid_customer_ids.COUNT
+                        -- FORALL을 사용한 배치 INSERT
+                        IF v_coupon_codes.COUNT > 0 THEN
+                            BEGIN
+                                FORALL i IN 1..v_coupon_codes.COUNT
                                     INSERT INTO BONUS_COUPON 
                                     (YYYYMM, CUSTOMER_ID, EMAIL, COUPON_CD, CREDIT_POINT, SEND_DT)
-                                    VALUES ('202506', l_valid_customer_ids(i), l_valid_customer_emails(i), 
-                                            l_valid_coupon_codes(i), l_valid_credit_points(i), NULL);
-                            END IF;
-                        END; 
-                                    
-                        DBMS_OUTPUT.PUT_LINE('BULK INSERT 완료: ' || l_customer_ids.COUNT || '건 (총 ' || v_insert_count || '건 처리)');
-                        
-                        COMMIT; -- 1000개 단위 (FETCH LIMIT) 로 COMMIT
-                        v_commit_count := v_commit_count + 1;
-                        DBMS_OUTPUT.PUT_LINE('Commit 실행: ' || v_insert_count || '건 처리됨 (총 ' || v_commit_count || '회 Commit)');
-                        
-                        -- 진행률 출력 (50,000건 단위)
-                        IF MOD(v_insert_count, 50000) = 0 THEN
-                            DBMS_OUTPUT.PUT_LINE('쿠폰 발급 진행률: ' || v_insert_count || '건 발급됨 (PL/SQL BULK 고속 처리!)');
+                                    VALUES ('202506', v_customer_ids(i), v_emails(i), 
+                                            v_coupon_codes(i), v_credit_points(i), v_send_dts(i));
+                                
+                                v_insert_count := v_insert_count + v_coupon_codes.COUNT;
+                                
+                                DBMS_OUTPUT.PUT_LINE('FORALL Insert 완료: ' || v_coupon_codes.COUNT || '건 (배치 ' || v_bulk_count || ')');
+                                
+                                -- 10,000건 단위 Commit
+                                IF MOD(v_insert_count, 10000) = 0 OR (v_insert_count - MOD(v_insert_count, 10000)) < 10000 THEN
+                                    COMMIT;
+                                    v_commit_count := v_commit_count + 1;
+                                    DBMS_OUTPUT.PUT_LINE('Commit 실행: ' || v_insert_count || '건 처리됨 (총 ' || v_commit_count || '회 Commit)');
+                                END IF;
+                                
+                                -- 진행률 출력 (50,000건 단위)
+                                IF MOD(v_insert_count, 50000) = 0 THEN
+                                    DBMS_OUTPUT.PUT_LINE('쿠폰 발급 진행률: ' || v_insert_count || '건 발급됨 (Bulk + FORALL 고속 처리!)');
+                                END IF;
+                                
+                            EXCEPTION
+                                WHEN OTHERS THEN
+                                    v_error_count := v_error_count + v_coupon_codes.COUNT;
+                                    DBMS_OUTPUT.PUT_LINE('FORALL Insert 오류 (배치 ' || v_bulk_count || '): ' || SQLERRM);
+                            END;
                         END IF;
                         
                         -- 전체 진행률 출력 (100,000건 단위)
                         IF MOD(v_processed_count, 100000) = 0 THEN
-                            DBMS_OUTPUT.PUT_LINE('전체 처리 진행률: ' || v_processed_count || '건 조회됨');
+                            DBMS_OUTPUT.PUT_LINE('전체 처리 진행률: ' || v_processed_count || '건 조회됨 (' || v_bulk_count || '개 배치 완료)');
+                        END IF;
+                        
+                        -- 너무 많은 오류시 중단
+                        IF v_error_count > 5000 THEN
+                            DBMS_OUTPUT.PUT_LINE('❌ 오류가 너무 많이 발생했습니다. 처리를 중단합니다.');
+                            EXIT;
                         END IF;
                         
                     END LOOP;
+                    
+                    -- Cursor 닫기
                     CLOSE customer_cursor;
+                    
+                    -- 마지막 남은 데이터 Commit
+                    IF MOD(v_insert_count, 10000) != 0 THEN
+                        COMMIT;
+                        v_commit_count := v_commit_count + 1;
+                        DBMS_OUTPUT.PUT_LINE('✅ 최종 Commit 실행: ' || v_insert_count || '건 처리 완료 (총 ' || v_commit_count || '회 Commit)');
+                    END IF;
                     
                     -- 최종 결과 출력
                     DBMS_OUTPUT.PUT_LINE('');
-                    DBMS_OUTPUT.PUT_LINE('=== PL/SQL 처리 결과 (BULK COLLECT + FORALL) ===');
+                    DBMS_OUTPUT.PUT_LINE('=== PL/SQL Bulk 처리 결과 ===');
                     DBMS_OUTPUT.PUT_LINE('총 조회 건수: ' || v_processed_count || '건');
+                    DBMS_OUTPUT.PUT_LINE('총 배치 수: ' || v_bulk_count || '개 (배치당 ' || v_batch_size || '건)');
                     DBMS_OUTPUT.PUT_LINE('쿠폰 발급 건수: ' || v_insert_count || '건');
                     DBMS_OUTPUT.PUT_LINE('처리 오류 건수: ' || v_error_count || '건');
                     DBMS_OUTPUT.PUT_LINE('총 Commit 횟수: ' || v_commit_count || '회');
@@ -213,14 +253,17 @@ public class Calc_Bonus_by_callstmt_2 {
                     
                 EXCEPTION
                     WHEN OTHERS THEN
-                        ROLLBACK;
-                        DBMS_OUTPUT.PUT_LINE('심각한 오류 발생: ' || SQLERRM);
+                        -- Cursor가 열려있으면 닫기
                         IF customer_cursor%ISOPEN THEN
                             CLOSE customer_cursor;
                         END IF;
+                        ROLLBACK;
+                        DBMS_OUTPUT.PUT_LINE('❌ 심각한 오류 발생: ' || SQLERRM);
                         RAISE;
                 END;
                 """;
+
+            System.out.println("PL/SQL Anonymous Block 생성 완료 (Bulk Collect + FORALL 방식)");
 
             // 4. CallableStatement 생성 및 실행
             callStmt = conn.prepareCall(plsqlBlock);
@@ -231,7 +274,8 @@ public class Calc_Bonus_by_callstmt_2 {
             callStmt.registerOutParameter(3, Types.INTEGER); // 오류 건수
             callStmt.registerOutParameter(4, Types.INTEGER); // 커밋 횟수
 
-            System.out.println("CallableStatement 실행 시작 (PL/SQL BULK 처리)...");
+            System.out.println("CallableStatement 실행 시작...");
+            System.out.println("(모든 처리가 DB 서버에서 Bulk 방식으로 진행됩니다)");
 
             // PL/SQL 블록 실행
             callStmt.execute();
@@ -259,7 +303,7 @@ public class Calc_Bonus_by_callstmt_2 {
             if (conn != null) {
                 try {
                     conn.rollback();
-                    System.err.println("트랜잭션이 롤백되었습니다."); // err 스트림으로 변경
+                    System.out.println("트랜잭션이 롤백되었습니다.");
                 } catch (SQLException rollbackEx) {
                     System.err.println("롤백 실패: " + rollbackEx.getMessage());
                 }
@@ -275,22 +319,22 @@ public class Calc_Bonus_by_callstmt_2 {
             // 7. 리소스 정리
             closeResources(callStmt, conn);
 
-            // 최종 처리 결과 (전체 실행 시간)
+            // 최종 처리 결과
             long endTime = System.currentTimeMillis();
-            System.out.printf("%n=== 처리 완료 ===%n총 처리 시간: %,d ms%n", (endTime - startTime));
+            System.out.printf("%n=== 처리 완료 ===\n총 처리 시간: %,d ms%n", (endTime - startTime));
         }
     }
 
     /**
-     * 결과 출력 (메시지 업데이트)
+     * 결과 출력
      */
     private static void printResults(long startTime, int processedCount, int insertCount,
                                      int errorCount, int commitCount) {
         long endTime = System.currentTimeMillis();
         long executionTime = endTime - startTime;
 
-        System.out.println("\n=== CallableStatement (PL/SQL BULK) 처리 결과 ===");
-        System.out.printf("총 조회 건수: %,d건 (2013년 이후 가입자)%n", processedCount);
+        System.out.println("\n=== CallableStatement (PL/SQL Bulk) 처리 결과 ===");
+        System.out.printf("총 조회 건수: %,d건 (2018년 이후 가입자)%n", processedCount);
         System.out.printf("쿠폰 발급 건수: %,d건%n", insertCount);
         System.out.printf("처리 오류 건수: %,d건%n", errorCount);
         System.out.printf("총 Commit 횟수: %d회%n", commitCount);
@@ -299,10 +343,15 @@ public class Calc_Bonus_by_callstmt_2 {
         if (errorCount > 0) {
             System.out.printf("• 오류율: %.2f%%\n", ((double)errorCount / processedCount) * 100);
         }
+
+        if (processedCount > 0) {
+            System.out.printf("• 처리 속도: %,.0f건/초\n",
+                    (double)processedCount / (executionTime / 1000.0));
+        }
     }
 
     /**
-     * 기존 테이블 데이터 삭제 (동일)
+     * 기존 테이블 데이터 삭제
      */
     private static void truncateTable(Connection conn) throws SQLException {
         Statement stmt = null;
@@ -322,7 +371,7 @@ public class Calc_Bonus_by_callstmt_2 {
     }
 
     /**
-     * 처리 결과 검증 (동일)
+     * 처리 결과 검증
      */
     private static void validateResults(Connection conn) throws SQLException {
         Statement stmt = null;
@@ -341,7 +390,7 @@ public class Calc_Bonus_by_callstmt_2 {
 
             rs = stmt.executeQuery(validationSQL);
 
-            System.out.println("\n=== 쿠폰 발급 결과 검증 ===");
+            System.out.println("\n=== 쿠폰 발급 결과 검증 (Bulk 처리) ===");
             System.out.println("쿠폰코드\t발급건수\t평균포인트");
             System.out.println("--------------------------------");
 
@@ -362,7 +411,7 @@ public class Calc_Bonus_by_callstmt_2 {
                 SELECT 
                     (SELECT COUNT(*) FROM BONUS_COUPON WHERE YYYYMM = '202506') as 발급건수,
                     (SELECT COUNT(*) FROM CUSTOMER 
-                     WHERE ENROLL_DT >= DATE '2013-01-01' 
+                     WHERE ENROLL_DT >= DATE '2018-01-01' 
                        AND CREDIT_LIMIT IS NOT NULL 
                        AND EMAIL IS NOT NULL 
                        AND ID IS NOT NULL) as 대상건수
@@ -379,7 +428,7 @@ public class Calc_Bonus_by_callstmt_2 {
                             ratio, issuedCount, targetCount);
 
                     if (Math.abs(ratio - 100.0) < 1.0) {
-                        System.out.println("✅ 발급률이 정상 범위입니다.");
+                        System.out.println("✅ 발급률이 정상 범위입니다. (Bulk 처리 성공)");
                     } else {
                         System.out.printf("⚠️  발급률 이상: %.1f%% (100%와 %.1f%% 차이)%n",
                                 ratio, Math.abs(ratio - 100.0));
@@ -406,13 +455,13 @@ public class Calc_Bonus_by_callstmt_2 {
     }
 
     /**
-     * 리소스 정리 (동일)
+     * 리소스 정리
      */
     private static void closeResources(CallableStatement callStmt, Connection conn) {
         if (callStmt != null) {
             try {
                 callStmt.close();
-                System.out.println("CallableStatement 정리 완료 (PL/SQL BULK 처리 완료)");
+                System.out.println("CallableStatement 정리 완료 (PL/SQL Bulk 처리 완료)");
             } catch (SQLException e) {
                 System.err.println("CallableStatement 정리 중 오류: " + e.getMessage());
             }
