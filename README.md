@@ -44,7 +44,7 @@ DB 위치(로컬 / 원격) 및 네트워크 환경에 따른 성능 편차를 �
 
 ## 5. 과제 수행 결과
 
-<img width="880" height="601" alt="image" src="https://github.com/user-attachments/assets/23c3cf6e-11ef-42ff-a445-e3b649d34d4d" />
-<img width="880" height="529" alt="image" src="https://github.com/user-attachments/assets/a3b30146-f7d1-402d-9a75-fb2569ab9bf1" />
-<img width="880" height="536" alt="image" src="https://github.com/user-attachments/assets/ca019e51-d731-4473-9461-ce55cf41327a" />
-<img width="880" height="598" alt="image" src="https://github.com/user-attachments/assets/6c60181c-8dc5-4818-9833-d9300c4c23ee" />
+<img width="800" height="530" alt="image" src="https://github.com/user-attachments/assets/0d9fcc7d-b5a8-43bf-b5ae-057867417664" />
+<img width="800" height="530" alt="image" src="https://github.com/user-attachments/assets/e6cc5148-adaa-425d-9eb4-4957fafec59e" />
+<img width="820" height="500" alt="image" src="https://github.com/user-attachments/assets/5115a826-7431-4715-acce-c704a82f0ccf" />
+<img width="810" height="530" alt="image" src="https://github.com/user-attachments/assets/48a7e4c1-575a-4a11-9ac3-b77f5c5279b8" />
